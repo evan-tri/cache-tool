@@ -1,0 +1,9 @@
+[package]
+name = "cache-tool"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3 = "1"
+walkdir = "2"
+dirs = "5"
