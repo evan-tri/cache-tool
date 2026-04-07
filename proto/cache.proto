@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package cache;
+
+service Cache {
+    rpc Check (CheckRequest) returns (CheckResponse);
+    rpc Get (GetRequest) returns (stream GetResponse);
+    rpc Put (stream PutRequest) returns (PutResponse);
+}
+
+message CheckRequest {
+    string hash = 1;
+}
+
+message CheckResponse {
+    bool exists = 1;
+}
+
+message GetRequest {
+    string hash = 1;
+}
+
+message GetResponse {
+    bytes chunk = 1;
+}
+
+message PutRequest {
+    oneof data{
+        string hash = 1;
+        bytes chunk = 2;
+    }
+}
+
+message PutResponse {
+    bool ok = 1;
+}

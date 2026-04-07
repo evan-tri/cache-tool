@@ -44,6 +44,7 @@ fn main() {
                 .join("blobs")
                 .join(&hash_string);
 
+            //Unpack existing blob if found
             if std::fs::metadata(&blob_path).is_ok() {
                 let file = std::fs::File::open(&blob_path).unwrap();
                 let decoder = zstd::Decoder::new(file).unwrap();
@@ -51,6 +52,7 @@ fn main() {
                 let mut archive = tar::Archive::new(decoder);
                 archive.unpack(".").unwrap();
 
+            //Write blob to cache
             } else {
                 std::fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
 
@@ -62,8 +64,6 @@ fn main() {
                     .status()
                     .expect("Failed to run command");
 
-                
-
                 let mut archive = tar::Builder::new(encoder);
                 archive.append_path(output_file).unwrap();
 
@@ -73,7 +73,7 @@ fn main() {
                 std::process::exit(status.code().unwrap_or(1));
             }
         }
-        
+
     } else {
         eprintln!("Missing arguments");
         std::process::exit(1);
