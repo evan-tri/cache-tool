@@ -355,3 +355,253 @@ async fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CMD: [&str; 2] = ["cargo", "build"];
+    const OUT: [&str; 1] = ["out.bin"];
+
+    fn args(outputs: &[&str], command: &[&str]) -> Args {
+        Args {
+            outputs: outputs.iter().map(|s| s.to_string()).collect(),
+            remote: None,
+            api_key: None,
+            cache_dir: None,
+            command: command.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new(files: &[(&str, &str)]) -> Self {
+            let root = std::env::temp_dir().join(format!("cache-tool-fixture-{}", Uuid::new_v4()));
+            let fixture = Fixture(root);
+            for (relative, contents) in files {
+                fixture.write(relative, contents);
+            }
+            fixture
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn write(&self, relative: &str, contents: &str) {
+            let path = self.0.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create fixture dir");
+            }
+            std::fs::write(&path, contents).expect("write fixture file");
+        }
+
+        fn hash(&self, outputs: &[&str], command: &[&str]) -> String {
+            compute_hash(&args(outputs, command), &self.0).expect("compute hash")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // ------------------------------------------------------ Determinism
+
+    #[test]
+    fn the_same_tree_hashes_the_same_way_twice() {
+        let tree = Fixture::new(&[("src/a.rs", "one"), ("src/b.rs", "two")]);
+
+        assert_eq!(tree.hash(&OUT, &CMD), tree.hash(&OUT, &CMD));
+    }
+
+    #[test]
+    fn two_identical_trees_in_different_directories_hash_alike() {
+        let files = [("src/a.rs", "one"), ("src/nested/b.rs", "two")];
+        let first = Fixture::new(&files);
+        let second = Fixture::new(&files);
+
+        assert_ne!(first.path(), second.path());
+        assert_eq!(first.hash(&OUT, &CMD), second.hash(&OUT, &CMD));
+    }
+
+    #[test]
+    fn file_order_does_not_affect_the_hash() {
+        let forwards = Fixture::new(&[("a.rs", "1"), ("b.rs", "2"), ("c.rs", "3")]);
+        let backwards = Fixture::new(&[("c.rs", "3"), ("b.rs", "2"), ("a.rs", "1")]);
+
+        assert_eq!(forwards.hash(&OUT, &CMD), backwards.hash(&OUT, &CMD));
+    }
+
+    // -------------------------------------------- What must change the key
+
+    #[test]
+    fn renaming_a_file_changes_the_hash() {
+        let before = Fixture::new(&[("src/a.rs", "identical contents")]);
+        let after = Fixture::new(&[("src/b.rs", "identical contents")]);
+
+        assert_ne!(before.hash(&OUT, &CMD), after.hash(&OUT, &CMD));
+    }
+
+    #[test]
+    fn moving_bytes_between_files_changes_the_hash() {
+        // Both trees concatenate to the same bytes ("ab" + "c" and "a" + "bc"),
+        // so only the length delimiter distinguishes them. A single file each:
+        // with two files the interleaved filenames would disambiguate on their
+        // own and the length would not actually be under test.
+        let name_ab = Fixture::new(&[("ab", "c")]);
+        let name_a = Fixture::new(&[("a", "bc")]);
+
+        assert_ne!(name_ab.hash(&OUT, &CMD), name_a.hash(&OUT, &CMD));
+    }
+
+    #[test]
+    fn inputs_are_collected_in_sorted_order() {
+        // Tested directly rather than through the hash: NTFS already returns
+        // directory entries in name order, so an end-to-end test cannot observe
+        // a missing sort on Windows. It is still load-bearing on ext4 and on
+        // network filesystems.
+        let tree = Fixture::new(&[
+            ("zebra.rs", "z"),
+            ("alpha.rs", "a"),
+            ("middle/m.rs", "m"),
+            ("beta.rs", "b"),
+        ]);
+
+        let collected = collect_inputs(&args(&OUT, &CMD), tree.path());
+        let paths: Vec<&str> = collected.iter().map(|(p, _)| p.as_str()).collect();
+
+        let mut expected = paths.clone();
+        expected.sort_unstable();
+
+        assert_eq!(paths, expected, "collect_inputs must return sorted paths");
+        assert_eq!(paths.len(), 4);
+    }
+
+    #[test]
+    fn changing_the_build_command_changes_the_hash() {
+        let tree = Fixture::new(&[("src/a.rs", "source")]);
+
+        assert_ne!(
+            tree.hash(&OUT, &["cargo", "build"]),
+            tree.hash(&OUT, &["cargo", "build", "--release"])
+        );
+    }
+
+    #[test]
+    fn changing_the_declared_outputs_changes_the_hash() {
+        let tree = Fixture::new(&[("src/a.rs", "source")]);
+
+        assert_ne!(tree.hash(&["a.bin"], &CMD), tree.hash(&["b.bin"], &CMD));
+    }
+
+    #[test]
+    fn editing_a_file_changes_the_hash() {
+        let tree = Fixture::new(&[("src/a.rs", "before")]);
+        let before = tree.hash(&OUT, &CMD);
+
+        tree.write("src/a.rs", "after");
+
+        assert_ne!(before, tree.hash(&OUT, &CMD));
+    }
+
+    // ---------------------------------------- What must NOT change the key
+
+    #[test]
+    fn declared_outputs_are_not_hashed_as_inputs() {
+        let tree = Fixture::new(&[("src/a.rs", "source"), ("out.bin", "first build")]);
+        let before = tree.hash(&["out.bin"], &CMD);
+
+        tree.write("out.bin", "a completely different artifact");
+
+        assert_eq!(
+            before,
+            tree.hash(&["out.bin"], &CMD),
+            "hashing a declared output makes the key change every build"
+        );
+    }
+
+    #[test]
+    fn a_declared_output_directory_is_excluded_recursively() {
+        let tree = Fixture::new(&[("src/a.rs", "source"), ("dist/app.js", "first")]);
+        let before = tree.hash(&["dist"], &CMD);
+
+        tree.write("dist/app.js", "rebuilt");
+        tree.write("dist/nested/chunk.js", "new file");
+
+        assert_eq!(before, tree.hash(&["dist"], &CMD));
+    }
+
+    #[test]
+    fn ignored_directories_do_not_affect_the_hash() {
+        let tree = Fixture::new(&[("src/a.rs", "source")]);
+        let before = tree.hash(&OUT, &CMD);
+
+        tree.write(".git/HEAD", "ref: refs/heads/master");
+        tree.write("target/debug/app", "compiled");
+        tree.write("node_modules/pkg/index.js", "dependency");
+        tree.write("cache-storage/blobs/abc", "someone else's blob");
+
+        assert_eq!(before, tree.hash(&OUT, &CMD));
+    }
+
+    // ------------------------------------------------------ Normalisation
+
+    #[test]
+    fn backslashes_and_forward_slashes_normalize_alike() {
+        assert_eq!(normalize(Path::new(r"src\main.rs")), "src/main.rs");
+        assert_eq!(normalize(Path::new("src/main.rs")), "src/main.rs");
+        assert_eq!(normalize(Path::new("./src/main.rs")), "src/main.rs");
+        assert_eq!(
+            normalize(Path::new(r".\src\nested\a.rs")),
+            "src/nested/a.rs"
+        );
+    }
+
+    // ------------------------------------------------------------- Errors
+
+    #[test]
+    fn an_unreadable_file_is_an_error_rather_than_an_empty_hash() {
+        let tree = Fixture::new(&[("src/a.rs", "readable")]);
+        let blocked = tree.path().join("blocked.rs");
+        std::fs::write(&blocked, "unreadable").expect("write blocked file");
+
+        #[cfg(windows)]
+        let _exclusive_handle = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&blocked)
+                .expect("open with exclusive share mode")
+        };
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000");
+
+            if std::fs::read(&blocked).is_ok() {
+                // Running with privileges that ignore mode bits, e.g. root in a
+                // container. The property cannot be exercised here.
+                return;
+            }
+        }
+
+        let result = compute_hash(&args(&OUT, &CMD), tree.path());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644));
+        }
+
+        assert!(
+            result.is_err(),
+            "an unreadable file must fail the hash rather than be treated as empty"
+        );
+    }
+}
