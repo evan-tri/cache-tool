@@ -2,6 +2,11 @@
 name = "cache-tool"
 version = "0.1.0"
 edition = "2024"
+description = "A language-agnostic distributed build cache: hash the inputs, skip the build, restore the outputs"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["build", "cache", "blake3", "grpc"]
+categories = ["development-tools::build-utils", "caching"]
 
 [dependencies]
 blake3 = "1"
@@ -11,6 +16,12 @@ zstd = "0.13"
 tar = "0.4"
 tonic = "0.12"
 prost = "0.13"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio-stream = "0.1"
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 tonic-build = "0.12"
+protox = "0.7"
