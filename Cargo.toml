@@ -3,6 +3,7 @@ name = "cache-tool"
 version = "0.1.0"
 edition = "2024"
 description = "A language-agnostic distributed build cache: hash the inputs, skip the build, restore the outputs"
+repository = "https://github.com/evan-tri/cache-tool"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["build", "cache", "blake3", "grpc"]
