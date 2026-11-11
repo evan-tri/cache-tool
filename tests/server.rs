@@ -4,8 +4,9 @@
 
 mod common;
 
-use common::{TestClient, TestServer, gb, test_hash};
+use common::{AuthInterceptor, TestClient, TestServer, gb, test_hash};
 
+use cache_tool::cache::cache_client::CacheClient;
 use cache_tool::cache::{CheckRequest, GetRequest, PutRequest, PutResponse, put_request};
 use tonic::Code;
 
@@ -406,4 +407,55 @@ async fn auth_applies_to_every_rpc() {
             .code(),
         Code::Unauthenticated
     );
+}
+
+// ------------------------------------------------------------------ TLS
+
+#[tokio::test]
+async fn a_tls_round_trip_works_when_the_ca_is_trusted() {
+    let server = TestServer::start_tls();
+    let mut client = server.client_tls_trusted().await;
+    let hash = test_hash("tls-round-trip");
+
+    put_blob(&mut client, &hash, b"encrypted in transit")
+        .await
+        .expect("put over tls should succeed");
+
+    assert_eq!(
+        get_blob(&mut client, &hash).await.expect("get over tls"),
+        b"encrypted in transit"
+    );
+}
+
+#[tokio::test]
+async fn connecting_to_a_tls_server_without_trusting_its_cert_fails() {
+    let server = TestServer::start_tls();
+
+    // Mirrors a client that omits --ca-cert against a self-signed server: the
+    // system trust store does not vouch for this certificate either.
+    let result = server.connect_tls_untrusted().await;
+
+    assert!(
+        result.is_err(),
+        "an untrusted self-signed certificate must not be accepted"
+    );
+}
+
+#[tokio::test]
+async fn a_plaintext_client_cannot_reach_a_tls_only_server() {
+    let server = TestServer::start_tls();
+
+    // tonic's Channel::connect() only opens the TCP socket; it does not speak
+    // HTTP/2 until the first request, so the failure only surfaces there.
+    let channel =
+        tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", server.port))
+            .expect("valid url")
+            .connect()
+            .await
+            .expect("tcp connects fine, tls is a separate layer");
+    let mut client: TestClient = CacheClient::with_interceptor(channel, AuthInterceptor(None));
+
+    check(&mut client, &test_hash("plaintext-against-tls"))
+        .await
+        .expect_err("a TLS-only server must not answer a plaintext request");
 }

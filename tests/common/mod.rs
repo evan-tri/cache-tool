@@ -9,9 +9,25 @@ use cache_tool::cache::cache_client::CacheClient;
 use tonic::codegen::InterceptedService;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
-use tonic::transport::Channel;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 
 pub type TestClient = CacheClient<InterceptedService<Channel, AuthInterceptor>>;
+
+/// The test fixture cert is self-signed for 127.0.0.1 / localhost with a
+/// 10-year expiry — see tests/data/tls/ — regenerate with:
+///   openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.pem \
+///     -days 3650 -nodes -subj "/CN=cache-tool-test" \
+///     -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \
+///     -addext "basicConstraints=critical,CA:FALSE" \
+///     -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+///     -addext "extendedKeyUsage=serverAuth"
+/// CA:FALSE is load-bearing: rustls refuses a CA-flagged certificate in the
+/// end-entity slot of a handshake, so a CA:TRUE leaf fails for the server
+/// even though it is otherwise a valid, if unconventional, trust anchor for
+/// the client's own ca_certificate().
+pub fn tls_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/tls")
+}
 
 #[derive(Clone)]
 pub struct AuthInterceptor(pub Option<String>);
@@ -35,6 +51,7 @@ pub struct TestServer {
     child: Option<Child>,
     api_key: Option<String>,
     max_size_gb: Option<f64>,
+    tls: bool,
     pub port: u16,
     pub storage: PathBuf,
 }
@@ -45,6 +62,14 @@ impl TestServer {
     }
 
     pub fn start_with(api_key: Option<&str>, max_size_gb: Option<f64>) -> Self {
+        Self::start_full(api_key, max_size_gb, false)
+    }
+
+    pub fn start_tls() -> Self {
+        Self::start_full(None, None, true)
+    }
+
+    fn start_full(api_key: Option<&str>, max_size_gb: Option<f64>, tls: bool) -> Self {
         let port = free_port();
         let storage = std::env::temp_dir().join(format!("cache-tool-test-{port}-{}", now_nanos()));
         std::fs::create_dir_all(&storage).expect("create storage dir");
@@ -53,6 +78,7 @@ impl TestServer {
             child: None,
             api_key: api_key.map(str::to_owned),
             max_size_gb,
+            tls,
             port,
             storage,
         };
@@ -83,6 +109,14 @@ impl TestServer {
         if let Some(gb) = self.max_size_gb {
             command.arg("--max-size-gb").arg(format!("{gb:.12}"));
         }
+        if self.tls {
+            let fixtures = tls_fixture_dir();
+            command
+                .arg("--tls-cert")
+                .arg(fixtures.join("server.pem"))
+                .arg("--tls-key")
+                .arg(fixtures.join("server.key"));
+        }
 
         command.env_remove("CACHE_SERVER_API_KEY");
 
@@ -91,7 +125,8 @@ impl TestServer {
     }
 
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        let scheme = if self.tls { "https" } else { "http" };
+        format!("{scheme}://127.0.0.1:{}", self.port)
     }
 
     pub fn blobs(&self) -> PathBuf {
@@ -136,6 +171,40 @@ impl TestServer {
             .expect("connect to test server");
 
         CacheClient::with_interceptor(channel, AuthInterceptor(api_key.map(str::to_owned)))
+    }
+
+    /// Connects trusting the fixture cert's own CA, as `--ca-cert` would.
+    pub async fn client_tls_trusted(&self) -> TestClient {
+        let ca = std::fs::read(tls_fixture_dir().join("server.pem")).expect("read fixture cert");
+        let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca));
+
+        let channel = Channel::from_shared(self.url())
+            .expect("valid url")
+            .tls_config(tls)
+            .expect("valid tls config")
+            .connect()
+            .await
+            .expect("connect over tls");
+
+        CacheClient::with_interceptor(channel, AuthInterceptor(None))
+    }
+
+    /// Connects the way a client with no --ca-cert and a self-signed server
+    /// would: nothing is trusted, so the handshake must fail.
+    pub async fn connect_tls_untrusted(&self) -> Result<TestClient, tonic::transport::Error> {
+        let tls = ClientTlsConfig::new().with_native_roots();
+
+        let channel = Channel::from_shared(self.url())
+            .expect("valid url")
+            .tls_config(tls)
+            .expect("valid tls config")
+            .connect()
+            .await?;
+
+        Ok(CacheClient::with_interceptor(
+            channel,
+            AuthInterceptor(None),
+        ))
     }
 
     fn wait_until_listening(&self) {
