@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{
+    Request, Response, Status,
+    transport::{Identity, Server, ServerTlsConfig},
+};
 use uuid::Uuid;
 
 use cache_tool::cache::cache_server::{Cache, CacheServer};
@@ -40,6 +43,16 @@ struct Args {
     /// process on the machine.
     #[arg(long, env = "CACHE_SERVER_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
+
+    /// TLS certificate chain (PEM). Requires --tls-key. Omit both to serve
+    /// plaintext, which is reasonable on 127.0.0.1 and not reasonable anywhere
+    /// else.
+    #[arg(long = "tls-cert", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// TLS private key (PEM). Requires --tls-cert.
+    #[arg(long = "tls-key", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -395,19 +408,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     db.evict(blobs, max_bytes).await;
 
-    let addr = args.addr.parse()?;
+    let addr: std::net::SocketAddr = args.addr.parse()?;
+    let tls_enabled = args.tls_cert.is_some();
+
+    if args.api_key.is_some() && !tls_enabled && !addr.ip().is_loopback() {
+        eprintln!(
+            "cache-server: warning — checking API keys over plaintext on a non-loopback address"
+        );
+    }
+
     println!(
-        "cache-server listening on {addr} (storage {}, cap {:.1} GB, auth {})",
+        "cache-server listening on {addr} (storage {}, cap {:.1} GB, auth {}, tls {})",
         args.storage.display(),
         args.max_size_gb,
         if args.api_key.is_some() {
             "required"
         } else {
             "disabled"
-        }
+        },
+        if tls_enabled { "enabled" } else { "disabled" }
     );
 
-    Server::builder()
+    let mut builder = Server::builder();
+
+    if let (Some(cert_path), Some(key_path)) = (&args.tls_cert, &args.tls_key) {
+        let cert = std::fs::read(cert_path)?;
+        let key = std::fs::read(key_path)?;
+        builder =
+            builder.tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))?;
+    }
+
+    builder
         .add_service(CacheServer::with_interceptor(
             service,
             RequireApiKey(args.api_key),

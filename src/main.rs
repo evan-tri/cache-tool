@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 
 use tonic::codegen::InterceptedService;
 use tonic::metadata::{Ascii, MetadataValue};
-use tonic::transport::Channel;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 
 use cache_tool::cache::cache_client::CacheClient;
 use cache_tool::cache::{CheckRequest, GetRequest, PutRequest, put_request};
@@ -38,6 +38,11 @@ struct Args {
     /// Where to keep the local cache. Defaults to the platform cache directory.
     #[arg(long = "cache-dir", env = "CACHE_TOOL_CACHE_DIR")]
     cache_dir: Option<PathBuf>,
+
+    /// Trust this CA certificate (PEM) for an https:// remote, instead of the
+    /// system trust store. Use this for a self-signed or private CA cert.
+    #[arg(long = "ca-cert")]
+    ca_cert: Option<PathBuf>,
 
     /// The build command, given after `--`.
     #[arg(last = true, required = true, allow_hyphen_values = true)]
@@ -187,8 +192,24 @@ fn brief(error: &Error) -> String {
     }
 }
 
-async fn connect(remote: &str, api_key: Option<String>) -> Result<Client, Error> {
-    let channel = Channel::from_shared(remote.to_string())?.connect().await?;
+async fn connect(
+    remote: &str,
+    api_key: Option<String>,
+    ca_cert: Option<&Path>,
+) -> Result<Client, Error> {
+    let mut endpoint = Channel::from_shared(remote.to_string())?;
+
+    if remote.starts_with("https://") {
+        let tls = match ca_cert {
+            Some(path) => {
+                ClientTlsConfig::new().ca_certificate(Certificate::from_pem(std::fs::read(path)?))
+            }
+            None => ClientTlsConfig::new().with_native_roots(),
+        };
+        endpoint = endpoint.tls_config(tls)?;
+    }
+
+    let channel = endpoint.connect().await?;
     Ok(CacheClient::with_interceptor(
         channel,
         AuthInterceptor(api_key),
@@ -199,11 +220,12 @@ async fn connect(remote: &str, api_key: Option<String>) -> Result<Client, Error>
 async fn fetch_remote(
     remote: &str,
     api_key: Option<String>,
+    ca_cert: Option<&Path>,
     hash: &str,
     blob: &Path,
     tmp: &Path,
 ) -> Result<bool, Error> {
-    let mut client = connect(remote, api_key).await?;
+    let mut client = connect(remote, api_key, ca_cert).await?;
 
     let exists = client
         .check(CheckRequest {
@@ -238,10 +260,11 @@ async fn fetch_remote(
 async fn upload_remote(
     remote: &str,
     api_key: Option<String>,
+    ca_cert: Option<&Path>,
     hash: &str,
     blob: &Path,
 ) -> Result<(), Error> {
-    let mut client = connect(remote, api_key).await?;
+    let mut client = connect(remote, api_key, ca_cert).await?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     let hash = hash.to_string();
@@ -292,6 +315,15 @@ async fn run() -> Result<i32, Error> {
         eprintln!("cache-tool: warning — sending an API key over plaintext HTTP");
     }
 
+    if args.ca_cert.is_some()
+        && !args
+            .remote
+            .as_deref()
+            .is_some_and(|remote| remote.starts_with("https://"))
+    {
+        eprintln!("cache-tool: warning — --ca-cert has no effect without an https:// --remote");
+    }
+
     let hash = compute_hash(&args, Path::new("."))?;
     let short = &hash[..12];
     let (blob_path, tmp_path) = cache_paths(&hash, args.cache_dir.as_deref())?;
@@ -303,7 +335,16 @@ async fn run() -> Result<i32, Error> {
     }
 
     if let Some(remote) = &args.remote {
-        match fetch_remote(remote, args.api_key.clone(), &hash, &blob_path, &tmp_path).await {
+        match fetch_remote(
+            remote,
+            args.api_key.clone(),
+            args.ca_cert.as_deref(),
+            &hash,
+            &blob_path,
+            &tmp_path,
+        )
+        .await
+        {
             Ok(true) => {
                 eprintln!("cache-tool: remote hit {short}");
                 unpack_blocking(&blob_path).await?;
@@ -337,7 +378,14 @@ async fn run() -> Result<i32, Error> {
     install(&tmp_path, &blob_path)?;
 
     if let Some(remote) = &args.remote
-        && let Err(e) = upload_remote(remote, args.api_key.clone(), &hash, &blob_path).await
+        && let Err(e) = upload_remote(
+            remote,
+            args.api_key.clone(),
+            args.ca_cert.as_deref(),
+            &hash,
+            &blob_path,
+        )
+        .await
     {
         eprintln!("cache-tool: upload failed ({})", brief(&e));
     }
@@ -369,6 +417,7 @@ mod tests {
             remote: None,
             api_key: None,
             cache_dir: None,
+            ca_cert: None,
             command: command.iter().map(|s| s.to_string()).collect(),
         }
     }
