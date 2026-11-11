@@ -12,7 +12,7 @@ cache-tool --outputs target/release/myapp -- cargo build --release
 
 ## Current State
 
-**V0.1 – V0.8 complete.** See [README.md](README.md) for usage, design notes,
+**V0.1 – V0.9 complete.** See [README.md](README.md) for usage, design notes,
 benchmarks, and limitations — it is the authoritative document now.
 
 | Version | What | Status |
@@ -25,10 +25,13 @@ benchmarks, and limitations — it is the authoritative document now.
 | V0.6 | SQLite LRU eviction | done |
 | V0.7 | Auth (API key via gRPC metadata) | done |
 | V0.8 | Polish, README, benchmarks | done |
-| — | Tests (31 Rust + 19 e2e), CI, mutation-verified | done |
+| V0.9 | TLS (`--tls-cert`/`--tls-key` on the server, `--ca-cert` on the client) | done |
+| — | License files + `repository` field (crates.io packaging requirement) | done |
+| — | Tests (34 Rust + 26 e2e), CI, mutation-verified | done |
 
-Not yet done: publishing to crates.io (needs `LICENSE` files and a `repository`
-field), and TLS.
+Not yet done: nothing blocks `cargo publish` or making the GitHub repo public.
+`cargo publish --dry-run` packages and verifies cleanly; publishing is a human
+action (crates.io account/token) rather than a code change.
 
 ## Project Structure
 
@@ -40,6 +43,7 @@ src/main.rs               cache-tool client
 src/bin/cache-server.rs   cache-server
 tests/server.rs           gRPC integration tests
 tests/common/mod.rs       test harness (spawns a real server)
+tests/data/tls/           self-signed fixture cert/key for TLS tests (see its README)
 scripts/e2e.sh            CLI end-to-end checks
 scripts/bench.sh          benchmark harness
 .github/workflows/ci.yml  test matrix + fmt/clippy gates
@@ -106,6 +110,16 @@ arbitrary. Now microseconds.
 the `dirs` crate reads the Known Folder API rather than `%LOCALAPPDATA%`. That
 made the client impossible to test in isolation and impossible to point at a
 persistent CI cache.
+
+**A `CA:TRUE` test certificate cannot also be the server's own leaf cert.**
+The first TLS fixture was a single self-signed cert marked as a CA, reused
+both as the server's identity and as the client's trust anchor. rustls
+rejected the handshake with `InvalidCertificate(CaUsedAsEndEntity)`: a
+certificate presented in the end-entity (leaf) slot may not carry the CA
+basic-constraint, even though the same certificate is a perfectly ordinary
+trust anchor when a client adds it directly via `ca_certificate()`. Fixed by
+generating the fixture with `CA:FALSE` plus `extendedKeyUsage=serverAuth`,
+which is also what a real self-signed deployment cert needs.
 
 ---
 

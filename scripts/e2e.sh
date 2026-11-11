@@ -40,9 +40,30 @@ cd "$SERVER_DIR" || exit 1
 SERVER_PID=$!
 cd "$WORK" || exit 1
 
+# A second server, TLS-only, using the fixture cert integration tests also use
+# (tests/data/tls). Windows needs cygpath here for the same reason --cache-dir
+# does below: these are CLI args passed straight to a Windows binary, not
+# something bash itself resolves.
+TLS_PORT=$(( (RANDOM % 5000) + 60000 ))
+TLS_SERVER_DIR="$WORK/server-tls"
+mkdir -p "$TLS_SERVER_DIR"
+CA_CERT="$ROOT/tests/data/tls/server.pem"
+TLS_KEY="$ROOT/tests/data/tls/server.key"
+if [ "${OS:-}" = "Windows_NT" ]; then
+  CA_CERT_ARG="$(cygpath -w "$CA_CERT")"
+  TLS_KEY_ARG="$(cygpath -w "$TLS_KEY")"
+else
+  CA_CERT_ARG="$CA_CERT"
+  TLS_KEY_ARG="$TLS_KEY"
+fi
+cd "$TLS_SERVER_DIR" || exit 1
+"$SRV" --addr "127.0.0.1:$TLS_PORT" --tls-cert "$CA_CERT_ARG" --tls-key "$TLS_KEY_ARG" >/dev/null 2>&1 &
+TLS_SERVER_PID=$!
+cd "$WORK" || exit 1
+
 cleanup() {
-  kill "$SERVER_PID" 2>/dev/null
-  wait "$SERVER_PID" 2>/dev/null
+  kill "$SERVER_PID" "$TLS_SERVER_PID" 2>/dev/null
+  wait "$SERVER_PID" "$TLS_SERVER_PID" 2>/dev/null
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -50,8 +71,12 @@ trap cleanup EXIT
 for _ in $(seq 1 200); do
   (echo > "/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break
 done
+for _ in $(seq 1 200); do
+  (echo > "/dev/tcp/127.0.0.1/$TLS_PORT") 2>/dev/null && break
+done
 
 REMOTE="http://127.0.0.1:$PORT"
+TLS_REMOTE="https://127.0.0.1:$TLS_PORT"
 export CACHE_TOOL_API_KEY="$KEY"
 cd "$WORK/proj" || exit 1
 
@@ -117,6 +142,22 @@ mkdir -p dist && echo "a" > dist/a.txt && echo "b" > dist/b.txt
 rm -rf dist
 "$CT" --outputs dist --cache-dir "$CACHE_ARG" --remote "$REMOTE" -- sh -c "echo c > dist/c.txt" >/dev/null 2>&1
 check "directory output restores"       "$(ls -1 dist 2>/dev/null | wc -l | tr -d ' ')" "3"
+
+rm -f out.txt; rm -rf "$CACHE/blobs"
+out=$("$CT" --outputs out.txt --cache-dir "$CACHE_ARG" --remote "$TLS_REMOTE" --ca-cert "$CA_CERT_ARG" -- cp input.txt out.txt 2>&1); code=$?
+check "tls cold run builds"             "$(echo "$out" | grep -c 'miss')" "1"
+check "tls cold run exits 0"            "$code" "0"
+check "tls blob uploaded to server"     "$(ls -1 "$TLS_SERVER_DIR/cache-storage/blobs" | wc -l | tr -d ' ')" "1"
+
+rm -f out.txt; rm -rf "$CACHE/blobs"
+out=$("$CT" --outputs out.txt --cache-dir "$CACHE_ARG" --remote "$TLS_REMOTE" --ca-cert "$CA_CERT_ARG" -- cp input.txt out.txt 2>&1)
+check "tls remote hit after local wipe" "$(echo "$out" | grep -c 'remote hit')" "1"
+check "tls output restored correctly"   "$(cat out.txt)" "payload two"
+
+rm -f out.txt; rm -rf "$CACHE/blobs"
+out=$("$CT" --outputs out.txt --cache-dir "$CACHE_ARG" --remote "$TLS_REMOTE" -- cp input.txt out.txt 2>&1); code=$?
+check "tls without --ca-cert still builds" "$code" "0"
+check "tls without --ca-cert warns"        "$(echo "$out" | grep -c 'remote unavailable')" "1"
 
 echo
 echo "passed=$pass failed=$fail"
